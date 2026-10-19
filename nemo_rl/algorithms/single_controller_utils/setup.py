@@ -63,6 +63,9 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.score_centering import (  # NRL score centering (GDPVal V2 port)
+    score_centering_num_samples,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
@@ -88,7 +91,9 @@ from nemo_rl.data_plane import (
 )
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
+    SC_STAGING_FIELDS,
     fields_with_optional_routed_experts,
+    fields_with_optional_score_centering,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -938,6 +943,85 @@ def _load_opd_full_teacher_lm_heads(
     )
 
 
+def _score_centering_setup_checks(master_config: MasterConfig) -> int:
+    """NRL score centering (GDPVal V2 port): validate the run shape, return ``m``.
+
+    Returns 0 (and checks nothing) when ``loss_fn.score_centering`` is absent or
+    disabled, so a run without the block takes exactly the stock path. With
+    centering on, refuses every configuration whose draws would not be i.i.d.
+    samples of the distribution the tokens were sampled from, or that has no
+    ingestion path on this base, instead of training a silent baseline.
+    """
+    num_samples = score_centering_num_samples(master_config.loss_fn)
+    if num_samples <= 0:
+        return 0
+    if not master_config.token_capture.enabled:
+        raise ValueError(
+            "loss_fn.score_centering requires token_capture.enabled=true on this "
+            "base: the sampler draws are captured by the vLLM worker and staged "
+            "beside each call's token delta; the chat-echo ingestion path is not "
+            "ported."
+        )
+    if getattr(master_config.token_capture, "top_logprobs", None) is not None:
+        # token_capture rides extra="allow", so a leftover knob from the top-k
+        # score-centering variant would otherwise be accepted and ignored.
+        raise ValueError(
+            "token_capture.top_logprobs belongs to the top-k score-centering "
+            "variant and has no effect here; remove it. This port draws "
+            "loss_fn.score_centering.num_samples i.i.d. samples per token."
+        )
+    generation_config = master_config.policy["generation"]
+    if generation_config["backend"] != "vllm":
+        raise ValueError(
+            "loss_fn.score_centering requires policy.generation.backend=vllm "
+            "(the i.i.d. draws come from the patched vLLM sampler)"
+        )
+    vllm_cfg = generation_config.get("vllm_cfg") or {}
+    if not vllm_cfg.get("async_engine", False):
+        raise ValueError(
+            "loss_fn.score_centering requires policy.generation.vllm_cfg.async_engine=true "
+            "(token capture runs in the async worker's HTTP server)"
+        )
+    megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+    if megatron_cfg.get("enabled", False) and megatron_cfg.get(
+        "use_fused_linear_logprobs", False
+    ):
+        raise ValueError(
+            "loss_fn.score_centering needs the full logits to gather the draws' "
+            "log-probs; set policy.megatron_cfg.use_fused_linear_logprobs=false"
+        )
+    logprobs_mode = vllm_cfg.get("logprobs_mode") or "raw_logprobs"
+    if logprobs_mode != "processed_logprobs":
+        temperature = float(generation_config.get("temperature", 1.0))
+        top_p = float(generation_config.get("top_p", 1.0))
+        top_k = generation_config.get("top_k")
+        untransformed = (
+            temperature == 1.0 and top_p == 1.0 and top_k in (None, -1, 0)
+        )
+        if not untransformed:
+            raise ValueError(
+                "loss_fn.score_centering draws must come from the distribution the "
+                "tokens are sampled from: set policy.generation.vllm_cfg."
+                "logprobs_mode=processed_logprobs (got "
+                f"{logprobs_mode!r} with temperature={temperature}, top_p={top_p}, "
+                f"top_k={top_k})"
+            )
+        print(
+            "[score_centering] WARNING: vllm_cfg.logprobs_mode="
+            f"{logprobs_mode!r}; with temperature=1, top_p=1 and no top_k the raw "
+            "and processed distributions coincide (absent vLLM logits processors), "
+            "so the draws are still taken from q. processed_logprobs is the "
+            "validated (V1) setting.",
+            flush=True,
+        )
+    print(
+        f"[score_centering] ENABLED: m={num_samples} i.i.d. sampler draws per token "
+        "via token capture (vLLM worker -> staging -> finalizer -> train fields)",
+        flush=True,
+    )
+    return num_samples
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1732,6 +1816,8 @@ def setup_single_controller(
     # partition can race kv_retrieve_meta and kill the controller thread
     # (see TQDataPlaneClient.register_partition).
     token_capture_cfg = master_config.token_capture
+    # NRL score centering (GDPVal V2 port): 0 = disabled (stock path below).
+    sc_num_samples = _score_centering_setup_checks(master_config)
     if not token_capture_cfg.enabled:
         # SingleController reuses one partition for the run. Warm every known
         # tensor field before rollout, policy, and teacher writers become
@@ -1777,6 +1863,12 @@ def setup_single_controller(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+        # NRL score centering (GDPVal V2 port): the finalizer writes the three
+        # draw columns into the canonical rows; registered only when enabled so
+        # a run without the block keeps an identical schema.
+        partition_fields = fields_with_optional_score_centering(
+            partition_fields, enabled=sc_num_samples > 0
+        )
         if processor is not None:
             partition_fields.extend(
                 field
@@ -1793,14 +1885,28 @@ def setup_single_controller(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            # NRL score centering (GDPVal V2 port): per-call draw deltas +
+            # presence flag (only when enabled).
+            + (list(SC_STAGING_FIELDS) if sc_num_samples > 0 else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        # NRL score centering (GDPVal V2 port): with m > 0 the workers verify
+        # the vLLM patch, request m i.i.d. draws on every admitted call and
+        # stage them beside each call's token delta.
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            **(
+                {"score_centering_num_samples": sc_num_samples}
+                if sc_num_samples > 0
+                else {}
+            ),
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -1863,6 +1969,9 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                # NRL score centering (GDPVal V2 port): rebuild the draw
+                # columns along the terminal chain (0 = disabled).
+                score_centering_num_samples=sc_num_samples,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

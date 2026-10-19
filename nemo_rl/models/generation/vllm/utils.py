@@ -504,6 +504,123 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
+# ---------------------------------------------------------------------------
+# NRL score centering (GDPVal V2 port): i.i.d. sampler draws under token capture
+# ---------------------------------------------------------------------------
+# Modules of the vLLM package the score-centering patch touches, with the
+# marker each patched copy defines (patches/vllm_score_centering_v0.25.1.diff).
+SC_VLLM_PATCHED_MODULES = (
+    "vllm.logprobs",
+    "vllm.v1.sample.sampler",
+    "vllm.v1.sample.rejection_sampler",
+    "vllm.entrypoints.openai.chat_completion.serving",
+)
+
+
+def verify_score_centering_vllm_patch() -> None:
+    """Refuse to run score centering on an unpatched or switched-off vLLM.
+
+    Called in every async vLLM worker by ``setup_token_capture`` when
+    ``loss_fn.score_centering`` is enabled. Every module in
+    ``SC_VLLM_PATCHED_MODULES`` must carry the ``NRL_SC_IID_LOGPROBS`` marker
+    and the switch must be on: with the stock (or switched-off) sampler the
+    ``top_logprobs`` slots hold the top-k tokens, which are NOT i.i.d. draws
+    from q (the V1 failure mode "NRL_SC_IID_LOGPROBS=0 silently falls back to
+    top-k"). Raises RuntimeError naming the offending files.
+    """
+    import importlib
+
+    problems: list[str] = []
+    for module_name in SC_VLLM_PATCHED_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as error:  # noqa: BLE001 — report every module at once
+            problems.append(f"{module_name}: import failed ({type(error).__name__}: {error})")
+            continue
+        flag = getattr(module, "NRL_SC_IID_LOGPROBS", None)
+        where = getattr(module, "__file__", "?")
+        if flag is None:
+            problems.append(f"{module_name} ({where}) is not the score-centering patched copy")
+        elif not flag:
+            problems.append(
+                f"{module_name} ({where}) has NRL_SC_IID_LOGPROBS switched off "
+                "(stock top-k logprobs)"
+            )
+    sampler_mod = importlib.import_module("vllm.v1.sample.sampler")
+    if not hasattr(getattr(sampler_mod, "Sampler", None), "gather_iid_sample_logprobs"):
+        problems.append("vllm.v1.sample.sampler.Sampler lacks gather_iid_sample_logprobs")
+    logprobs_mod = importlib.import_module("vllm.logprobs")
+    logprob_cls = getattr(logprobs_mod, "Logprob", None)
+    if logprob_cls is None or not hasattr(logprob_cls(logprob=0.0), "sc_count"):
+        problems.append("vllm.logprobs.Logprob lacks the sc_count multiplicity field")
+    if problems:
+        raise RuntimeError(
+            "loss_fn.score_centering is enabled but the vLLM in this worker "
+            "cannot produce i.i.d. sampler draws:\n  - "
+            + "\n  - ".join(problems)
+            + "\nMount the per-tree patched vLLM files "
+            "(gdpval_v2_sc/vllm_patched/, see notes/PORT_NOTES.md) and do not set "
+            "NRL_SC_IID_LOGPROBS=0."
+        )
+
+
+def extract_score_centering_draws(
+    final_request_output: Any,
+    *,
+    num_samples: int,
+) -> tuple[list[list[int]], list[list[float]], int]:
+    """Re-expand the ``m`` i.i.d. sampler draws per generated token of a captured call.
+
+    Reads the engine's per-position logprob containers of the single output a
+    captured call has (``output.logprobs``: one dict keyed by token id per
+    generated position, built by the patched ``vllm.logprobs`` with draw
+    multiplicities in ``Logprob.sc_count``).
+
+    Returns:
+        ``(draws [n_gen][m], draw_logprobs [n_gen][m], positions_with_repeats)``
+        aligned with ``output.token_ids`` (the generated ids the capture
+        adapter stages). ``positions_with_repeats`` counts positions where some
+        draw occurred more than once — a long call with none is the signature
+        of top-k slots masquerading as draws.
+
+    Raises:
+        RuntimeError: on an unpatched engine (no ``sc_count``), a draw-count
+            mismatch, or token/logprob length disagreement — stock top-k
+            entries are never accepted as draws.
+    """
+    from nemo_rl.algorithms.score_centering import (
+        expand_iid_draws_from_position_logprobs,
+    )
+
+    outputs = list(getattr(final_request_output, "outputs", None) or [])
+    if len(outputs) != 1:
+        raise RuntimeError(
+            f"score centering: a captured call must have exactly one output, got {len(outputs)}"
+        )
+    output = outputs[0]
+    token_ids = list(getattr(output, "token_ids", None) or [])
+    position_logprobs = getattr(output, "logprobs", None)
+    if not token_ids:
+        return [], [], 0
+    if position_logprobs is None or len(position_logprobs) != len(token_ids):
+        raise RuntimeError(
+            "score centering: generation output has "
+            f"{len(token_ids)} tokens but "
+            f"{0 if position_logprobs is None else len(position_logprobs)} "
+            "logprob positions"
+        )
+    draws: list[list[int]] = []
+    draw_logprobs: list[list[float]] = []
+    positions_with_repeats = 0
+    for position in position_logprobs:
+        ids, lps = expand_iid_draws_from_position_logprobs(position, num_samples)
+        if len(set(ids)) < len(ids):
+            positions_with_repeats += 1
+        draws.append(ids)
+        draw_logprobs.append([max(lp, VLLM_LOGPROB_FLOOR) for lp in lps])
+    return draws, draw_logprobs, positions_with_repeats
+
+
 def model_dump_chat_response_with_dynamic_message_fields(
     response: Any,
 ) -> dict[str, Any]:

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -61,8 +62,72 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
+    SC_STAGING_LOGPROBS_FIELD,
+    SC_STAGING_PRESENT_FIELD,
+    SC_STAGING_TOKEN_IDS_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment
+
+
+# NRL score centering (GDPVal V2 port). One staged call carries, beside its
+# token delta, the m i.i.d. sampler draws laid over the delta's positions
+# (``[delta_len, m]`` int32 ids / float32 sampler log-probs, carry positions
+# zero-filled; see ``score_centering.build_score_centering_delta``) and a
+# ``sc_present`` flag. The vLLM worker hands the tensors to the sink through a
+# per-call side channel (``set_score_centering_draws``) because Gym's capture
+# core (``complete_call_from_response``) has no attachment argument on this
+# base; ``stage`` pops them for the record it writes, in the same ``put``.
+# They are not digest-covered (Gym never sees them). Calls without draws write
+# one-row sentinels in each column's own dtype and ``sc_present=False``.
+def validate_score_centering_tensors(
+    ids: Any, lps: Any, *, num_samples: int, delta_len: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Check one call's draw tensors against the staging contract."""
+    if not isinstance(ids, torch.Tensor) or not isinstance(lps, torch.Tensor):
+        raise TypeError("score centering draws must be tensors")
+    if ids.dim() != 2 or lps.dim() != 2 or ids.shape != lps.shape:
+        raise ValueError(
+            "score centering draws must be [delta_len, m] pairs, got "
+            f"{tuple(ids.shape)} / {tuple(lps.shape)}"
+        )
+    if int(ids.shape[1]) != int(num_samples):
+        raise ValueError(
+            f"score centering draws carry {int(ids.shape[1])} draws per token, "
+            f"expected {num_samples}"
+        )
+    if delta_len is not None and int(ids.shape[0]) != int(delta_len):
+        raise ValueError(
+            f"score centering draws cover {int(ids.shape[0])} tokens, the staged "
+            f"delta has {delta_len}"
+        )
+    return ids.to(torch.int32).contiguous(), lps.to(torch.float32).contiguous()
+
+
+def _score_centering_columns(
+    draws: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    num_samples: int,
+    delta_len: int,
+) -> dict[str, torch.Tensor]:
+    """The three staging columns for one row (sentinels when the call has no draws)."""
+    if draws is None:
+        return {
+            SC_STAGING_TOKEN_IDS_FIELD: torch.zeros(
+                (1, 1, num_samples), dtype=torch.int32
+            ),
+            SC_STAGING_LOGPROBS_FIELD: torch.zeros(
+                (1, 1, num_samples), dtype=torch.float32
+            ),
+            SC_STAGING_PRESENT_FIELD: torch.tensor([False], dtype=torch.bool),
+        }
+    ids, lps = validate_score_centering_tensors(
+        draws[0], draws[1], num_samples=num_samples, delta_len=delta_len
+    )
+    return {
+        SC_STAGING_TOKEN_IDS_FIELD: ids.unsqueeze(0),
+        SC_STAGING_LOGPROBS_FIELD: lps.unsqueeze(0),
+        SC_STAGING_PRESENT_FIELD: torch.tensor([True], dtype=torch.bool),
+    }
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -128,6 +193,10 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    # NRL score centering (GDPVal V2 port): whether this call staged sampler
+    # draws (read with the base columns; ``fetch_score_centering`` reads the
+    # tensors).
+    sc_present: bool = False
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -153,9 +222,55 @@ class TQTokenSink:
     calls concurrently.
     """
 
-    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+    def __init__(
+        self,
+        dp_client: Any,
+        *,
+        staging_partition: str,
+        score_centering_num_samples: int = 0,
+    ) -> None:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
+        # NRL score centering (GDPVal V2 port): > 0 means the staging partition
+        # carries the three draw columns and every row written here fills them.
+        self._score_centering_num_samples = int(score_centering_num_samples)
+        # Per-call side channel: (rollout_id, model_call_id) -> ([L, m], [L, m]),
+        # set by the vLLM worker right before complete_call_from_response and
+        # popped by stage(). Keys are unique per call, so concurrent calls
+        # never share an entry; the lock only guards the dict itself.
+        self._sc_pending: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sc_lock = threading.Lock()
+
+    def set_score_centering_draws(
+        self,
+        rollout_id: str,
+        model_call_id: str,
+        ids: torch.Tensor,
+        lps: torch.Tensor,
+    ) -> tuple[str, str]:
+        """NRL score centering: register one call's draws for the next ``stage``."""
+        if self._score_centering_num_samples <= 0:
+            raise ValueError(
+                "score centering draws require a sink constructed with "
+                "score_centering_num_samples > 0 (loss_fn.score_centering.enabled)"
+            )
+        key = (str(rollout_id), str(model_call_id))
+        with self._sc_lock:
+            self._sc_pending[key] = (ids, lps)
+        return key
+
+    def discard_score_centering_draws(self, key: tuple[str, str]) -> None:
+        """NRL score centering: drop a registered entry ``stage`` did not consume."""
+        with self._sc_lock:
+            self._sc_pending.pop(key, None)
+
+    def _pop_score_centering_draws(
+        self, record: StagedCallRecord
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        with self._sc_lock:
+            return self._sc_pending.pop(
+                (str(record.rollout_id), str(record.model_call_id)), None
+            )
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -163,6 +278,15 @@ class TQTokenSink:
 
         key = record.staging_key
         try:
+            # NRL score centering (GDPVal V2 port): pop this call's draws first
+            # so a failed stage never leaves them behind.
+            sc_columns: dict[str, torch.Tensor] | None = None
+            if self._score_centering_num_samples > 0:
+                sc_columns = _score_centering_columns(
+                    self._pop_score_centering_draws(record),
+                    num_samples=self._score_centering_num_samples,
+                    delta_len=len(record.token_ids_delta),
+                )
             field_dict = {
                 "token_ids_delta": torch.tensor(
                     [record.token_ids_delta], dtype=torch.int64
@@ -267,6 +391,8 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+            if sc_columns is not None:
+                field_dict.update(sc_columns)  # NRL score centering (GDPVal V2 port)
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
@@ -330,9 +456,18 @@ class TQTokenSource:
     the base schema (worker feature-gating makes presence uniform per run).
     """
 
-    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+    def __init__(
+        self,
+        dp_client: Any,
+        *,
+        staging_partition: str,
+        score_centering_num_samples: int = 0,
+    ) -> None:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
+        # NRL score centering (GDPVal V2 port): > 0 reads ``sc_present`` with
+        # the base columns and enables ``fetch_score_centering``.
+        self._score_centering_num_samples = int(score_centering_num_samples)
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
@@ -387,6 +522,9 @@ class TQTokenSource:
             return []
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("finalization staging request contains duplicate keys")
+        base_fields = list(STAGING_FIELDS)
+        if self._score_centering_num_samples > 0:
+            base_fields.append(SC_STAGING_PRESENT_FIELD)  # NRL score centering
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -398,7 +536,7 @@ class TQTokenSource:
                         "get_samples",
                         sample_ids=list(staging_keys),
                         partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
+                        select_fields=base_fields + [ROUTED_EXPERTS_FIELD],
                     )
                 except Exception:  # noqa: BLE001 — field-not-present probe
                     rows = _call_dp(
@@ -406,7 +544,7 @@ class TQTokenSource:
                         "get_samples",
                         sample_ids=list(staging_keys),
                         partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
+                        select_fields=base_fields,
                     )
             else:
                 rows = _call_dp(
@@ -414,7 +552,7 @@ class TQTokenSource:
                     "get_samples",
                     sample_ids=list(staging_keys),
                     partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
+                    select_fields=base_fields,
                 )
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
@@ -441,6 +579,9 @@ class TQTokenSource:
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
                 )
+            sc_present = False
+            if self._score_centering_num_samples > 0:
+                sc_present = bool(_row_leaf(row, SC_STAGING_PRESENT_FIELD)[0].item())
             fetched.append(
                 FetchedStagedCall(
                     staging_key=key,
@@ -449,9 +590,71 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
+                    sc_present=sc_present,
                 )
             )
         return fetched
+
+    def fetch_score_centering(
+        self, items: list[FetchedStagedCall]
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """NRL score centering (GDPVal V2 port): one batched read of the draw columns.
+
+        ``items`` come from ``fetch_for_finalization`` and must all have
+        ``sc_present=True``. Returns ``([delta_len, m] int32, [delta_len, m]
+        float32)`` per item in request order. A transport miss raises
+        ``KeyError``; malformed columns raise ``TypeError`` / ``ValueError``.
+        """
+        if self._score_centering_num_samples <= 0:
+            raise ValueError(
+                "score centering reads require a staging source constructed with "
+                "score_centering_num_samples > 0"
+            )
+        if not items:
+            return []
+        if any(not item.sc_present for item in items):
+            raise ValueError("fetch_score_centering only accepts rows with sc_present=True")
+        keys = [item.staging_key for item in items]
+        if len(set(keys)) != len(keys):
+            raise KeyError("score centering fetch: staging keys contain duplicates")
+        try:
+            rows = _call_dp(
+                self._dp_client,
+                "get_samples",
+                sample_ids=keys,
+                partition_id=self._staging_partition,
+                select_fields=[SC_STAGING_TOKEN_IDS_FIELD, SC_STAGING_LOGPROBS_FIELD],
+            )
+        except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
+            raise KeyError(
+                f"score centering columns for {len(keys)} keys could not be fetched "
+                f"from {self._staging_partition!r}: {error}"
+            ) from error
+        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
+        if n_rows != len(keys):
+            raise KeyError(
+                f"score centering rows missing: requested {len(keys)}, got {n_rows} "
+                f"from {self._staging_partition!r}"
+            )
+        out: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for index, item in enumerate(items):
+            row = _select_row(rows, index)
+            ids = row[SC_STAGING_TOKEN_IDS_FIELD]
+            lps = row[SC_STAGING_LOGPROBS_FIELD]
+            if ids.ndim != 3 or lps.ndim != 3 or ids.shape[0] != 1 or lps.shape[0] != 1:
+                raise ValueError(
+                    "invalid score centering column shapes "
+                    f"{tuple(ids.shape)} / {tuple(lps.shape)} for {item.staging_key!r}"
+                )
+            out.append(
+                validate_score_centering_tensors(
+                    ids[0],
+                    lps[0],
+                    num_samples=self._score_centering_num_samples,
+                    delta_len=item.snapshot.delta_len,
+                )
+            )
+        return out
 
 
 def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:

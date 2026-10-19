@@ -78,6 +78,9 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    # NRL score centering (GDPVal V2 port): m i.i.d. sampler draws per generated
+    # token to rebuild from the staging columns (0 = disabled).
+    score_centering_num_samples: int = 0
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -132,6 +135,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            score_centering_num_samples=config.score_centering_num_samples,
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:

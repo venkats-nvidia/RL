@@ -623,23 +623,38 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        score_centering_num_samples: int = 0,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call.
+        single Gym ``install_capture`` call. ``score_centering_num_samples``
+        (NRL score centering, GDPVal V2 port) > 0 makes every worker verify the
+        patched vLLM sampler, request ``m`` i.i.d. draws on each admitted call
+        and stage them beside the call's token delta.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
             "is the worker's in-process HTTP server)"
+        )
+        # NRL score centering: forward the kwarg only when enabled so the
+        # disabled fan-out is byte-identical to the stock call.
+        sc_kwargs = (
+            {"score_centering_num_samples": int(score_centering_num_samples)}
+            if score_centering_num_samples > 0
+            else {}
         )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **sc_kwargs,
         )
         ray.get(futures)
 

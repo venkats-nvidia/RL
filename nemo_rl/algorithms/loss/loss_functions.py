@@ -24,6 +24,10 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
+from nemo_rl.algorithms.score_centering import (  # NRL score centering (GDPVal V2 port)
+    score_centering_config,
+    score_centering_num_samples,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -169,6 +173,16 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
+    # NRL score centering (GDPVal V2 port; Marek & Ryabinin, arXiv 2609.20807,
+    # i.i.d. sampler-draw variant). Optional block, read through
+    # ``extra="allow"``:
+    #   score_centering:
+    #     enabled: true
+    #     num_samples: 8      # m i.i.d. draws per generated token from the sampler
+    # Deliberately NOT a declared field: a declared default would add
+    # ``score_centering: null`` to every ``model_dump()`` and change the
+    # rollout-checkpoint fingerprint of runs that do not use it. Requires the
+    # patched vLLM sampler and token capture (see nemo_rl/algorithms/score_centering.py).
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -181,6 +195,13 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    # NRL score centering (GDPVal V2 port), present only when
+    # loss_fn.score_centering is enabled: per token the m i.i.d. sampler draws
+    # [B, S, m] int32, their sampler log-probs [B, S, m] float32, and 1.0 where
+    # the position carries draws [B, S] (0.0 = masked from the centering term).
+    sc_sample_token_ids: NotRequired[torch.Tensor]
+    sc_sample_logprobs: NotRequired[torch.Tensor]
+    sc_sample_mask: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -341,6 +362,57 @@ class ClippedPGLossFn(LossFunction):
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
 
+        # ---- NRL score centering (GDPVal V2 port; Marek & Ryabinin, arXiv
+        # 2609.20807), i.i.d.-sample variant (V1: venkats 2026-09-19).
+        # ``loss_fn.score_centering`` rides extra="allow".
+        sc_cfg = score_centering_config(cfg)
+        self.score_centering_enabled = bool(sc_cfg.get("enabled", False))
+        self.score_centering_num_samples = (
+            score_centering_num_samples(cfg) if self.score_centering_enabled else 0
+        )
+        if self.score_centering_enabled:
+            unknown_sc_keys = sorted(set(sc_cfg) - {"enabled", "num_samples"})
+            assert not unknown_sc_keys, (
+                f"loss_fn.score_centering: unknown keys {unknown_sc_keys} "
+                "(expected enabled, num_samples)"
+            )
+            assert not self.sequence_level_importance_ratios, (
+                "score centering is implemented for token-level importance weights only"
+            )
+            assert self.truncated_importance_sampling_type in (None, "tis"), (
+                "score centering supports truncated_importance_sampling_type=tis only "
+                "(the draws reuse the actor's TIS clamp)"
+            )
+            assert not self.use_cispo, (
+                "score centering is incompatible with use_cispo: the centering term "
+                "assumes the REINFORCE/PPO actor form, not the CISPO sg(clip)*logp form"
+            )
+            assert self.opd_full is None, (
+                "score centering applies to the policy-gradient objective, not to "
+                "the full-vocabulary MOPD (opd_full) objective"
+            )
+            assert not use_fused_linear_logprobs, (
+                "score centering needs the full logits to gather the draws' "
+                "log-probs; disable the chunked linear-CE fusion"
+            )
+            if not (self.force_on_policy_ratio or self.disable_ppo_ratio):
+                warnings.warn(
+                    "score centering with a live PPO ratio: the centering term is "
+                    "gated by the PPO clip (tokens whose actor term is clipped are "
+                    "not centered) and weighted by clamp(p_theta/q) of the CURRENT "
+                    "policy, while the actor's TIS weight uses prev_logprobs; the "
+                    "validated V1 recipe used force_on_policy_ratio=true "
+                    "(REINFORCE + TIS, one optimizer step per rollout batch).",
+                    stacklevel=2,
+                )
+            print(
+                "[ClippedPGLossFn] score centering ENABLED (GDPVal V2 port): "
+                f"{self.score_centering_num_samples} i.i.d. sampler draws per token; "
+                "the centering term uses the same importance-weight clamp as the "
+                "actor term",
+                flush=True,
+            )
+
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
         # that pick the denominators — so split-API trainers can undo the
@@ -388,6 +460,19 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.score_centering_enabled:
+            # NRL score centering (GDPVal V2 port): all four are
+            # masked_mean(..., global_normalization_factor=global_valid_toks),
+            # i.e. normalized by ALL loss tokens (V1 convention; divide by
+            # sc_coverage to read conditional means over covered tokens).
+            self.metric_normalizations.update(
+                {
+                    "sc_coverage": MetricNormalizer.TOKENS,
+                    "sc_mean_weight": MetricNormalizer.TOKENS,
+                    "sc_clipped_fraction": MetricNormalizer.TOKENS,
+                    "sc_sample_lp_error": MetricNormalizer.TOKENS,
+                }
+            )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -417,6 +502,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        next_token_sample_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -433,6 +519,11 @@ class ClippedPGLossFn(LossFunction):
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            next_token_sample_logprobs: NRL score centering (GDPVal V2 port):
+                trainer log-probs ``log p_theta(v_j)`` of the ``m`` i.i.d.
+                sampler draws per position, ``[B, S - 1, m]`` with grad, aligned
+                with ``next_token_logprobs``. Required when
+                ``loss_fn.score_centering.enabled``.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -810,7 +901,113 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=correct_valid_toks,
                 )
 
-        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
+        # -----------------------------------------------------------------
+        # NRL score centering (GDPVal V2 port; Marek & Ryabinin, arXiv
+        # 2609.20807), i.i.d.-sample variant. For token t with m draws
+        # v_j ~ q_t (the sampler distribution the token was drawn from) the
+        # centered, importance-weighted score is
+        #     w_t grad log p(y_t) - (1/m) sum_j w_{v_j} grad log p(v_j),
+        #     w = clamp(p/q, tis_min, tis_max), stop-grad,
+        # i.e. the paper's sum_v q_v w_v grad log p_v (Eq. 14) estimated with
+        # i.i.d. samples from q instead of the exact top-k sum. It is added as
+        # a per-token loss whose VALUE is 0 and whose gradient is
+        # A_t (1/m) sum_j w_j grad log p(v_j), masked and normalized exactly
+        # like the actor term (tokens without draws are excluded through
+        # sc_sample_mask), so loss curves stay comparable to the baseline.
+        # -----------------------------------------------------------------
+        sc_loss = torch.zeros((), device=curr_logprobs.device, dtype=curr_logprobs.dtype)
+        sc_metrics: dict = {}
+        if self.score_centering_enabled:
+            if next_token_sample_logprobs is None:
+                raise RuntimeError(
+                    "score centering needs next_token_sample_logprobs (the trainer "
+                    "log-probs of the sampler draws); prepare_loss_input / "
+                    "prepare_packed_loss_input provide it, a custom prepare_fn must too"
+                )
+            sc_curr = next_token_sample_logprobs.to(torch.float32)  # [B, S-1, m], grad
+            sc_gen = data["sc_sample_logprobs"][:, 1:, :].to(sc_curr.dtype)  # log q(v_j)
+            sc_tok_mask = data["sc_sample_mask"][:, 1:].to(mask.dtype)
+            sc_mask = mask * sc_tok_mask
+            assert sc_curr.shape == sc_gen.shape, (
+                f"score centering shapes: trainer {tuple(sc_curr.shape)} vs "
+                f"sampler {tuple(sc_gen.shape)}"
+            )
+            with torch.no_grad():
+                sc_w_raw = torch.nan_to_num(
+                    torch.exp(sc_curr.detach() - sc_gen), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                if self.use_importance_sampling_correction:
+                    if self.truncated_importance_sampling_ratio is not None:
+                        sc_tis_min = (
+                            self.truncated_importance_sampling_ratio_min
+                            if self.truncated_importance_sampling_ratio_min is not None
+                            else 0.0
+                        )
+                        sc_w = sc_w_raw.clamp(
+                            min=sc_tis_min, max=self.truncated_importance_sampling_ratio
+                        )
+                        sc_clipped = (
+                            (sc_w_raw > self.truncated_importance_sampling_ratio)
+                            | (sc_w_raw < sc_tis_min)
+                        ).float().mean(dim=-1)
+                    else:
+                        sc_w = sc_w_raw
+                        sc_clipped = torch.zeros_like(sc_tok_mask)
+                else:
+                    sc_w = torch.ones_like(sc_w_raw)
+                    sc_clipped = torch.zeros_like(sc_tok_mask)
+                # Tokens whose actor term is clipped carry no score gradient,
+                # so they are not centered either (V1: loss1 >= loss2; all-true
+                # under force_on_policy_ratio / disable_ppo_ratio). Dual-clipped
+                # tokens (A < 0 and -A*c below the PPO term) are likewise
+                # gradient-free in the actor term and are excluded as well.
+                sc_active_bool = loss1 >= loss2
+                if self.ratio_clip_c is not None:
+                    sc_dual_clipped = (advantages < 0) & (
+                        (-advantages * self.ratio_clip_c) < torch.max(loss1, loss2)
+                    )
+                    sc_active_bool = sc_active_bool & ~sc_dual_clipped
+                sc_active = sc_active_bool.to(sc_w.dtype)
+            # value 0; grad = (1/m) sum_j w_j grad log p(v_j)
+            sc_center = (sc_w * (sc_curr - sc_curr.detach())).mean(dim=-1)
+            sc_per_token = advantages * sc_active * sc_center
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                sc_loss = masked_mean(
+                    sc_per_token, sc_mask, global_normalization_factor=global_valid_toks
+                )
+            else:
+                sc_loss = masked_mean(
+                    masked_mean(sc_per_token, token_mask * sc_tok_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+            with torch.no_grad():
+                sc_metrics = {
+                    # fraction of loss tokens that carry sampler draws (~1.0 expected)
+                    "sc_coverage": masked_mean(
+                        sc_tok_mask, mask, global_normalization_factor=global_valid_toks
+                    ).item(),
+                    # Monte-Carlo E_q[clamp(p/q)] x coverage: 1.0 x coverage = no
+                    # truncation residual (nothing to correct at that token)
+                    "sc_mean_weight": masked_mean(
+                        sc_w.mean(dim=-1),
+                        sc_mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "sc_clipped_fraction": masked_mean(
+                        sc_clipped, sc_mask, global_normalization_factor=global_valid_toks
+                    ).item(),
+                    # mean |log p_theta(v_j) - log q(v_j)| over the draws
+                    # (trainer/sampler mismatch on off-sample tokens)
+                    "sc_sample_lp_error": masked_mean(
+                        (sc_curr.detach() - sc_gen).abs().mean(dim=-1),
+                        sc_mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
+
+        # NRL score centering (GDPVal V2 port): sc_loss is 0-valued, gradient only.
+        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss + sc_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -862,6 +1059,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                **sc_metrics,  # NRL score centering (GDPVal V2 port)
             },
         )
 

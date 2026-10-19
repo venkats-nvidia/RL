@@ -151,11 +151,19 @@ from nemo_rl.data_plane.schema import (
     INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    fields_with_optional_score_centering,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.algorithms.score_centering import (  # NRL score centering (GDPVal V2 port)
+    SC_NO_DRAWS_MESSAGE,
+    SC_TAG_WITH_DRAWS,
+    SC_TAG_WITHOUT_DRAWS,
+    format_score_centering_plumbing_line,
+    score_centering_num_samples,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -259,13 +267,23 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
+    score_centering_required: bool = False,
 ) -> tuple[str, ...]:
-    """Return only the data-plane columns produced for this train step."""
-    return tuple(
+    """Return only the data-plane columns produced for this train step.
+
+    ``score_centering_required`` (NRL score centering, GDPVal V2 port) appends
+    the three per-token draw columns the token-capture finalizer writes when
+    ``loss_fn.score_centering`` is enabled; a run without it fetches the
+    unchanged list.
+    """
+    fields = tuple(
         field
         for field in DP_TRAIN_FIELDS
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
+    )
+    return tuple(
+        fields_with_optional_score_centering(fields, enabled=score_centering_required)
     )
 
 
@@ -338,9 +356,19 @@ class SingleControllerActor:
             and not self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
         self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
+        # NRL score centering (GDPVal V2 port): m i.i.d. sampler draws per token
+        # the loss expects (0 = disabled); per-step plumbing counts from row tags.
+        self._score_centering_num_samples = score_centering_num_samples(
+            master_config.loss_fn
+        )
+        self._sc_step_counts: dict[str, int] = {
+            SC_TAG_WITH_DRAWS: 0,
+            SC_TAG_WITHOUT_DRAWS: 0,
+        }
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
+            score_centering_required=self._score_centering_num_samples > 0,
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -2863,6 +2891,29 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                if self._score_centering_num_samples > 0:
+                    # NRL score centering (GDPVal V2 port): per-step plumbing
+                    # line (V1 driver print) + the V1 follow-up guard: a step
+                    # whose generated calls ALL lack draws means the sampler /
+                    # worker draw capture is inactive; refuse to train the
+                    # baseline under the score-centering name.
+                    sc_with = self._sc_step_counts[SC_TAG_WITH_DRAWS]
+                    sc_missing = self._sc_step_counts[SC_TAG_WITHOUT_DRAWS]
+                    print(
+                        format_score_centering_plumbing_line(
+                            sc_with, sc_missing, self._score_centering_num_samples
+                        ),
+                        flush=True,
+                    )
+                    step_metrics["score_centering/calls_with_draws"] = float(sc_with)
+                    step_metrics["score_centering/calls_without_draws"] = float(
+                        sc_missing
+                    )
+                    self._sc_step_counts = {k: 0 for k in self._sc_step_counts}
+                    if sc_with == 0 and sc_missing > 0:
+                        raise RuntimeError(
+                            SC_NO_DRAWS_MESSAGE.format(missing=sc_missing)
+                        )
                 try:
                     policy_cfg = getattr(self._master_config, "policy", None)
                     max_seq_len = (
@@ -4737,6 +4788,11 @@ class SingleControllerActor:
         for tag in meta.tags or []:
             for key in VIOLATION_TAG_KEYS:
                 self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
+            if self._score_centering_num_samples > 0:
+                # NRL score centering (GDPVal V2 port): terminal-chain calls
+                # with and without sampler draws, from the finalizer's row tags.
+                for key in self._sc_step_counts:
+                    self._sc_step_counts[key] += int(tag.get(key, 0))
 
         if self._advantage_estimator is None:
             return meta, True

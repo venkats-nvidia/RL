@@ -47,6 +47,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    extract_score_centering_draws,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -199,6 +200,15 @@ class VllmAsyncGenerationWorkerImpl(
         # exact engine prompt ids recorded at preprocess time).
         self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
         self._staging_source: Any | None = None
+        # NRL score centering (GDPVal V2 port): m i.i.d. sampler draws per
+        # generated token requested on every admitted call (0 = off; set by
+        # setup_token_capture), the worker's TQTokenSink (draws ride its
+        # per-call side channel), and the expanded draws of finished admitted
+        # calls keyed by id(request) until _finish_request_capture stages them.
+        self._score_centering_num_samples = 0
+        self._capture_sink: Any | None = None
+        self._sc_pending_draws: dict[int, tuple[list, list, int]] = {}
+        self._sc_no_repeat_warned = False
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
         self._prefix_cache: dict[str, list[int]] = {}
@@ -465,7 +475,10 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        score_centering_num_samples: int = 0,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -474,9 +487,21 @@ class VllmAsyncGenerationWorkerImpl(
         ``install_capture`` call wiring Gym's engine-blind capture core +
         vLLM adapter into this worker. Returns whether capture was installed
         (False on non-model-owner ranks, which serve no HTTP).
+
+        ``score_centering_num_samples`` (NRL score centering, GDPVal V2 port)
+        > 0 first verifies that this worker's vLLM is the patched i.i.d.-draw
+        copy with the switch on (hard error otherwise), then makes every
+        admitted call return ``m`` draws per generated token, staged beside
+        the call's token delta.
         """
         if not self.is_model_owner:
             return False
+        if score_centering_num_samples > 0:
+            from nemo_rl.models.generation.vllm.utils import (
+                verify_score_centering_vllm_patch,
+            )
+
+            verify_score_centering_vllm_patch()
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -485,7 +510,13 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        sink = TQTokenSink(
+            dp_client,
+            staging_partition=staging_partition,
+            score_centering_num_samples=score_centering_num_samples,
+        )
+        self._capture_sink = sink
+        self._score_centering_num_samples = int(score_centering_num_samples)
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -662,6 +693,7 @@ class VllmAsyncGenerationWorkerImpl(
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
+            self._sc_pending_draws.pop(id(request), None)  # NRL score centering
             return content
         call, prompt_token_ids = state
         payload = dict(content)
@@ -670,6 +702,7 @@ class VllmAsyncGenerationWorkerImpl(
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         adapter = self.token_capture.adapter
+        generated_token_ids: list[int] = []
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
@@ -681,7 +714,42 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(call, payload)
+        sc_key = None
+        if self._score_centering_num_samples > 0:
+            # NRL score centering (GDPVal V2 port): hand this call's draws to
+            # the sink's side channel; TQTokenSink.stage (called synchronously
+            # inside complete_call_from_response) writes them in the same put
+            # as the token delta. A malformed draw set poisons the call exactly
+            # like any other capture failure (never staged as plain tokens).
+            try:
+                sc_key = self._register_score_centering_draws(
+                    request,
+                    call,
+                    prompt_len=len(prompt_token_ids),
+                    generated_token_ids=generated_token_ids,
+                )
+            except (RuntimeError, ValueError, TypeError) as error:
+                LOGGER.error(
+                    "score centering: poisoning rollout %s call %s: %s",
+                    call.rollout_id,
+                    call.model_call_id,
+                    error,
+                )
+                coords = self.token_capture.fail_call(
+                    call, reason=f"score_centering:{error}"
+                )
+                for choice in content.get("choices") or []:
+                    choice.pop("logprobs", None)
+                    message = choice.get("message")
+                    if isinstance(message, dict):
+                        message.pop("routed_experts", None)
+                content["ng_commit_coords"] = coords.model_dump()
+                return content
+        try:
+            coords = self.token_capture.complete_call_from_response(call, payload)
+        finally:
+            if sc_key is not None and self._capture_sink is not None:
+                self._capture_sink.discard_score_centering_draws(sc_key)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # The delta-aligned routes were staged to TQ above; the served
@@ -692,8 +760,67 @@ class VllmAsyncGenerationWorkerImpl(
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
+    def _register_score_centering_draws(
+        self,
+        request: Any,
+        call: Any,
+        *,
+        prompt_len: int,
+        generated_token_ids: list[int],
+    ) -> tuple[str, str] | None:
+        """NRL score centering (GDPVal V2 port): lay this call's draws over its delta.
+
+        Returns the sink side-channel key, or None when the call carries no
+        draws (the sink then stages ``sc_present=False`` sentinels and the
+        finalizer masks the call's positions from the centering term).
+        """
+        from nemo_rl.algorithms.score_centering import build_score_centering_delta
+
+        pending = self._sc_pending_draws.pop(id(request), None)
+        generated_len = len(generated_token_ids)
+        if pending is None:
+            if generated_len:
+                LOGGER.warning(
+                    "score centering: admitted call %s staged without sampler draws "
+                    "(the engine output carried none); masked from the centering term",
+                    call.model_call_id,
+                )
+            return None
+        draws, draw_logprobs, positions_with_repeats = pending
+        if len(draws) != generated_len or len(draw_logprobs) != generated_len:
+            raise RuntimeError(
+                f"{len(draws)} draw rows for {generated_len} generated tokens"
+            )
+        if (
+            generated_len >= 256
+            and positions_with_repeats == 0
+            and not self._sc_no_repeat_warned
+        ):
+            # i.i.d. draws repeat at every low-entropy position; top-k slots
+            # never do. One warning per worker; the loss metric
+            # sc_mean_weight / sc_coverage ~ 1.0 is the authoritative check.
+            self._sc_no_repeat_warned = True
+            LOGGER.warning(
+                "score centering: %d generated positions without a single repeated "
+                "draw; i.i.d. draws should repeat at low-entropy positions. Check "
+                "that the patched vLLM sampler is active in the engine processes.",
+                generated_len,
+            )
+        carry_len = int(prompt_len) - int(call.admission.prev_len)
+        ids, lps = build_score_centering_delta(
+            draws=draws,
+            draw_logprobs=draw_logprobs,
+            carry_len=carry_len,
+            num_samples=self._score_centering_num_samples,
+        )
+        assert self._capture_sink is not None
+        return self._capture_sink.set_score_centering_draws(
+            call.rollout_id, call.model_call_id, ids, lps
+        )
+
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
+        self._sc_pending_draws.pop(id(request), None)  # NRL score centering
         state = self._capture_calls.pop(id(request), None)
         if state is not None and self.token_capture is not None:
             self.token_capture.fail_call(state[0], reason=reason)
@@ -708,6 +835,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from pydantic import PrivateAttr  # NRL score centering (GDPVal V2 port)
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -877,6 +1005,21 @@ class VllmAsyncGenerationWorkerImpl(
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
+                # NRL score centering (GDPVal V2 port): every admitted
+                # (captured) call must return m i.i.d. sampler draws per
+                # generated token. Gym's capture handler pins top_logprobs=0
+                # and the HTTP response stays that way; only the engine-side
+                # sample-logprob count is raised to m, through the request's
+                # to_sampling_params, which vLLM 0.25 calls after this
+                # preprocess step.
+                if (
+                    admission is not None
+                    and worker_self._score_centering_num_samples > 0
+                    and isinstance(request, NeMoRLChatCompletionRequest)
+                ):
+                    request._nrl_sc_num_logprobs = (
+                        worker_self._score_centering_num_samples
+                    )
                 capture_prefix_token_ids: list[int] | None = None
                 if admission is not None and admission.mode == "token_in":
                     capture_prefix_token_ids = await asyncio.to_thread(
@@ -983,6 +1126,18 @@ class VllmAsyncGenerationWorkerImpl(
             # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
+            # NRL score centering (GDPVal V2 port): engine sample-logprob count
+            # forced on admitted calls (m i.i.d. draws per generated token).
+            # Private: never part of the request schema or its serialization.
+            _nrl_sc_num_logprobs: Optional[int] = PrivateAttr(default=None)
+
+            def to_sampling_params(self, *args, **kwargs):
+                params = super().to_sampling_params(*args, **kwargs)
+                if self._nrl_sc_num_logprobs:
+                    # NRL score centering: the patched sampler fills these m
+                    # slots with i.i.d. draws from the served distribution.
+                    params.logprobs = int(self._nrl_sc_num_logprobs)
+                return params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
@@ -1037,6 +1192,19 @@ class VllmAsyncGenerationWorkerImpl(
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
+                    )
+
+                # NRL score centering (GDPVal V2 port): expand the m i.i.d.
+                # draws of an admitted call from the engine output (raises on an
+                # unpatched engine or a draw-count mismatch; the caller then
+                # aborts the capture). Staged in _finish_request_capture.
+                sc_num_logprobs = getattr(request, "_nrl_sc_num_logprobs", None)
+                if sc_num_logprobs and worker_self._score_centering_num_samples > 0:
+                    worker_self._sc_pending_draws[id(request)] = (
+                        extract_score_centering_draws(
+                            final_res,
+                            num_samples=worker_self._score_centering_num_samples,
+                        )
                     )
 
                 if worker_self._return_routed_experts_enabled():

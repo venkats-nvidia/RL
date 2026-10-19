@@ -41,10 +41,26 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.score_centering import (  # NRL score centering (GDPVal V2 port)
+    SC_TAG_WITH_DRAWS,
+    SC_TAG_WITHOUT_DRAWS,
+    assemble_score_centering_row,
+)
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
-from nemo_rl.experience.payload import pack_payload
+from nemo_rl.data_plane.schema import (
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    SC_SAMPLE_LOGPROBS_FIELD,
+    SC_SAMPLE_MASK_FIELD,
+    SC_SAMPLE_TOKEN_IDS_FIELD,
+    TRUNCATED,
+)
+from nemo_rl.data_plane.tq_token_sink import (
+    FetchedStagedCall,
+    TQTokenSink,
+    TQTokenSource,
+)
+from nemo_rl.experience.payload import _VIOLATION_COUNTS_KEY, pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -79,6 +95,16 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    # NRL score centering (GDPVal V2 port): the m i.i.d. sampler draws per
+    # position rebuilt along the terminal chain ([len(token_ids), m] int32 /
+    # float32), the per-token presence mask ([len(token_ids)] float32: 1 on
+    # generated tokens of calls that staged draws), and how many chain calls
+    # did / did not carry draws. None / 0 when centering is off or rejected.
+    sc_sample_token_ids: Optional[torch.Tensor] = None
+    sc_sample_logprobs: Optional[torch.Tensor] = None
+    sc_sample_mask: Optional[torch.Tensor] = None
+    sc_calls_with_draws: int = 0
+    sc_calls_without_draws: int = 0
 
 
 @dataclass
@@ -118,8 +144,12 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
+        score_centering_num_samples: int = 0,
     ) -> None:
         self._dp_client = dp_client
+        # NRL score centering (GDPVal V2 port): > 0 reads the per-call draw
+        # columns and publishes the three canonical sc_* columns with every group.
+        self._score_centering_num_samples = int(score_centering_num_samples)
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
@@ -134,7 +164,11 @@ class RolloutReassembler:
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
-        self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
+        self._source = TQTokenSource(
+            dp_client,
+            staging_partition=staging_partition,
+            score_centering_num_samples=self._score_centering_num_samples,
+        )
         # The sink's clear() is the staging-partition delete; no staging
         # writes happen here.
         self._staging = TQTokenSink(dp_client, staging_partition=staging_partition)
@@ -236,6 +270,13 @@ class RolloutReassembler:
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
+        # NRL score centering (GDPVal V2 port): draws along the verified
+        # terminal chain (after token verification, so a rejected rollout never
+        # moves draw columns).
+        sc_row, sc_failure = self._resolve_score_centering(row, fetched_by_call)
+        if sc_failure is not None:
+            return rejected(sc_failure, staging_keys)
+
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None
         if self._router_replay_enabled:
@@ -316,7 +357,59 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
+            sc_sample_token_ids=sc_row[0] if sc_row is not None else None,
+            sc_sample_logprobs=sc_row[1] if sc_row is not None else None,
+            sc_sample_mask=sc_row[2] if sc_row is not None else None,
+            sc_calls_with_draws=sc_row[3] if sc_row is not None else 0,
+            sc_calls_without_draws=sc_row[4] if sc_row is not None else 0,
         )
+
+    def _resolve_score_centering(
+        self,
+        row: Any,
+        fetched_by_call: dict[str, FetchedStagedCall],
+    ) -> tuple[
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]],
+        Optional[str],
+    ]:
+        """NRL score centering (GDPVal V2 port): read the draw columns along the chain.
+
+        Each staged call row holds the draws for its own delta (carry positions
+        zero-filled); the terminal chain's deltas are concatenated in order,
+        exactly like Gym's ``verify_and_linearize`` concatenates the token
+        deltas. Chain calls that staged no draws leave their positions
+        zero-filled with mask 0 and are counted in ``sc_calls_without_draws``.
+        Returns ``((ids, logprobs, mask, calls_with, calls_without), reason)``;
+        ``(None, None)`` when centering is off.
+        """
+        if self._score_centering_num_samples <= 0:
+            return None, None
+        items: list[FetchedStagedCall] = []
+        for call_id, _carry_len, _generation_len in row.link_spans:
+            item = fetched_by_call.get(call_id)
+            if item is None:
+                return None, f"score_centering_chain_identity:{call_id}"
+            if item.sc_present:
+                items.append(item)
+        deltas_by_call: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        if items:
+            try:
+                parts = self._source.fetch_score_centering(items)
+            except (KeyError, TypeError, ValueError) as error:
+                return None, f"invalid_score_centering_columns:{error}"
+            deltas_by_call = {
+                item.snapshot.model_call_id: part for item, part in zip(items, parts)
+            }
+        try:
+            assembled = assemble_score_centering_row(
+                link_spans=row.link_spans,
+                token_mask=row.token_mask,
+                deltas_by_call=deltas_by_call,
+                num_samples=self._score_centering_num_samples,
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            return None, f"score_centering_assembly:{error}"
+        return assembled, None
 
     def _execute_direct_plan(
         self,
@@ -537,6 +630,37 @@ class RolloutReassembler:
                 dtype=torch.bool,
             ),
         }
+        if self._score_centering_num_samples > 0:
+            # NRL score centering (GDPVal V2 port): [n, max_len, m] draws +
+            # sampler log-probs, [n, max_len] presence mask (placeholder /
+            # rejected rows all-zero), per-row tag counts for the controller's
+            # plumbing line and no-draws guard, and a per-group coverage rate.
+            m = self._score_centering_num_samples
+            sc_ids = torch.zeros((n, max_len, m), dtype=torch.int32)
+            sc_lps = torch.zeros((n, max_len, m), dtype=torch.float32)
+            sc_mask = torch.zeros((n, max_len), dtype=torch.float32)
+            sc_tags: list[dict[str, int]] = []
+            calls_with = calls_without = 0
+            for i, row in enumerate(rows):
+                tag = {SC_TAG_WITH_DRAWS: 0, SC_TAG_WITHOUT_DRAWS: 0}
+                if row.valid and row.sc_sample_token_ids is not None:
+                    length = int(row.sc_sample_token_ids.shape[0])
+                    sc_ids[i, :length] = row.sc_sample_token_ids
+                    sc_lps[i, :length] = row.sc_sample_logprobs
+                    sc_mask[i, :length] = row.sc_sample_mask
+                    tag[SC_TAG_WITH_DRAWS] = int(row.sc_calls_with_draws)
+                    tag[SC_TAG_WITHOUT_DRAWS] = int(row.sc_calls_without_draws)
+                    calls_with += int(row.sc_calls_with_draws)
+                    calls_without += int(row.sc_calls_without_draws)
+                sc_tags.append(tag)
+            train_batch[SC_SAMPLE_TOKEN_IDS_FIELD] = sc_ids
+            train_batch[SC_SAMPLE_LOGPROBS_FIELD] = sc_lps
+            train_batch[SC_SAMPLE_MASK_FIELD] = sc_mask
+            train_batch[_VIOLATION_COUNTS_KEY] = sc_tags
+            total_calls = calls_with + calls_without
+            metrics["finalize/score_centering_calls_with_draws_rate"] = (
+                calls_with / total_calls if total_calls else 0.0
+            )
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:

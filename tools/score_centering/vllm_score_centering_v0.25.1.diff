@@ -1,0 +1,215 @@
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -13,6 +13,13 @@
+ from vllm.v1.sample.ops.logprobs import batched_count_greater_than
+ from vllm.v1.sample.ops.penalties import apply_all_penalties
+ from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
++import os as _os
++
++# NRL score centering (arXiv 2609.20807, i.i.d. variant; GDPVal V2 port of venkats' V1 2026-09-19): when a request
++# asks for top_logprobs=m the sampler returns m i.i.d. draws from its own token distribution (with replacement,
++# duplicates kept) instead of the m most likely tokens. Default ON in this patched copy; NRL_SC_IID_LOGPROBS=0
++# restores stock top-k (a score-centering run then refuses to start). Prompt logprobs are gathered as top-k.
++NRL_SC_IID_LOGPROBS = _os.environ.get("NRL_SC_IID_LOGPROBS", "1").strip().lower() not in ("0", "false", "off", "no")
+ 
+ _SAMPLING_EPS = 1e-5
+ 
+@@ -124,6 +131,14 @@
+             logprobs_tensors = LogprobsTensors(
+                 torch.empty(0), raw_logprobs, torch.empty(0)
+             )
++        elif NRL_SC_IID_LOGPROBS and num_logprobs > 0:
++            # NRL score centering: i.i.d. draws from the served distribution in the top-k slots.
++            assert logprobs_mode in ("raw_logprobs", "processed_logprobs"), (
++                f"NRL_SC_IID_LOGPROBS needs a *_logprobs logprobs_mode, got {logprobs_mode}"
++            )
++            logprobs_tensors = self.gather_iid_sample_logprobs(
++                raw_logprobs, num_logprobs, token_ids=sampled
++            )
+         else:
+             # Gather the logprobs and ranks of the topk and sampled token.
+             logprobs_tensors = self.gather_logprobs(
+@@ -356,6 +371,37 @@
+         return LogprobsTensors(indices, logprobs, token_ranks)
+ 
+     @staticmethod
++    def gather_iid_sample_logprobs(
++        logprobs: torch.Tensor,
++        num_samples: int,
++        token_ids: torch.Tensor,
++    ) -> LogprobsTensors:
++        """NRL score centering: like gather_logprobs, but the `num_samples` extra slots hold i.i.d. draws
++        v_1..v_m ~ q (the distribution `logprobs` describes, i.e. the one the token was sampled from), drawn
++        WITH replacement, together with log q(v_j). Slot 0 is still the sampled token, its logprob and rank.
++
++        Args:
++          logprobs: (num tokens) x (vocab) float log-probabilities of the served sampling distribution
++          num_samples: number m of i.i.d. draws per position
++          token_ids: sampled token ids, 1D int64 (num tokens)
++        Returns:
++          LogprobsTensors(indices [N, m+1] int32, logprobs [N, m+1], sampled-token ranks [N])
++        """
++        assert token_ids.dtype == torch.int64
++        token_ids = token_ids.unsqueeze(-1)
++        token_logprobs = logprobs.gather(-1, token_ids)
++        # Same dynamo hints as gather_logprobs (avoid batch-size 0/1 recompiles).
++        torch._dynamo.decorators.mark_unbacked(logprobs, 0)
++        torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
++        token_ranks = batched_count_greater_than(logprobs, token_logprobs)
++        probs = torch.exp(logprobs.to(torch.float32))
++        samples = torch.multinomial(probs, num_samples, replacement=True)  # [N, m]
++        sample_logprobs = logprobs.gather(-1, samples)
++        indices = torch.cat((token_ids, samples), dim=1).to(torch.int32)
++        out_logprobs = torch.cat((token_logprobs, sample_logprobs), dim=1)
++        return LogprobsTensors(indices, out_logprobs, token_ranks)
++
++    @staticmethod
+     def _combine_outputs_with_spec_tokens(
+         output_token_ids: list[list[int]],
+         spec_token_ids: list[list[int]] | None = None,
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -18,7 +18,10 @@
+ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+ from vllm.v1.sample.ops.penalties import apply_all_penalties
+ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+-from vllm.v1.sample.sampler import Sampler
++from vllm.v1.sample.sampler import (  # NRL score centering: shared i.i.d.-draw switch
++    NRL_SC_IID_LOGPROBS,
++    Sampler,
++)
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+ 
+@@ -239,6 +242,18 @@
+             if self.is_logits_logprobs_mode
+             else self.sampler.compute_logprobs(accepted_logits)
+         )
++        if NRL_SC_IID_LOGPROBS and max_num_logprobs > 0:
++            # NRL score centering: each accepted position draws its m i.i.d. samples from the target
++            # distribution that position's token was accepted under (rejection sampling makes the
++            # accepted token exactly target-distributed), not the top-k.
++            assert not self.is_logits_logprobs_mode, (
++                "NRL_SC_IID_LOGPROBS needs a *_logprobs logprobs_mode under speculative decoding"
++            )
++            return self.sampler.gather_iid_sample_logprobs(
++                accepted_logprobs,
++                max_num_logprobs,
++                accepted_tokens.to(torch.int64),
++            )
+         return self.sampler.gather_logprobs(
+             accepted_logprobs,
+             max_num_logprobs,
+--- a/vllm/logprobs.py
++++ b/vllm/logprobs.py
+@@ -4,6 +4,13 @@
+ from collections.abc import Iterable, Iterator, MutableSequence
+ from dataclasses import dataclass, field
+ from typing import overload
++import os as _os
++
++# NRL score centering (arXiv 2609.20807, i.i.d. variant; GDPVal V2 port of venkats' V1 2026-09-19): when a request
++# asks for top_logprobs=m the sampler returns m i.i.d. draws from its own token distribution (with replacement,
++# duplicates kept) instead of the m most likely tokens. Default ON in this patched copy; NRL_SC_IID_LOGPROBS=0
++# restores stock top-k (a score-centering run then refuses to start). Prompt logprobs are gathered as top-k.
++NRL_SC_IID_LOGPROBS = _os.environ.get("NRL_SC_IID_LOGPROBS", "1").strip().lower() not in ("0", "false", "off", "no")
+ 
+ 
+ # We use dataclass for now because it is used for
+@@ -22,6 +29,8 @@
+     logprob: float
+     rank: int | None = None
+     decoded_token: str | None = None
++    # NRL score centering: multiplicity of this token among the i.i.d. sampler draws of the position (0 = not a draw)
++    sc_count: int = 0
+ 
+ 
+ LogprobsOnePosition = dict[int, Logprob]
+@@ -186,6 +195,31 @@
+     # We do not need a special case for the sampled token
+     # being in the topk, since inserting duplicated data
+     # into a dictionary twice is the same as doing it once.
++    if NRL_SC_IID_LOGPROBS and num_logprobs > 0:
++        # NRL score centering: slot 0 = sampled token, slots 1..m = i.i.d. sampler draws (duplicates allowed). A dict
++        # keyed by token id would collapse repeats, so multiplicities are kept in Logprob.sc_count and re-expanded by
++        # the serving layer (nrl_sc_expand_iid_top_logprobs) / the NeMo-RL worker.
++        assert not isinstance(request_logprobs, FlatLogprobs), (
++            "NRL_SC_IID_LOGPROBS does not support flat_logprobs containers"
++        )
++        position: dict[int, Logprob] = {}
++        for idx, (token_id, logprob, token) in enumerate(
++            zip(token_ids, logprobs, decoded_tokens)
++        ):
++            if idx > num_logprobs:
++                break
++            if idx == 0:
++                position[token_id] = Logprob(
++                    logprob=logprob, rank=rank, decoded_token=token
++                )
++                continue
++            entry = position.get(token_id)
++            if entry is None:
++                entry = Logprob(logprob=logprob, rank=None, decoded_token=token)
++                position[token_id] = entry
++            entry.sc_count += 1
++        request_logprobs.append(position)
++        return
+     topk_ranks = range(1, num_logprobs + 1)
+     ranks = itertools.chain((rank,), topk_ranks)
+ 
+@@ -204,3 +238,17 @@
+                 )
+             }
+         )
++
++
++def nrl_sc_expand_iid_top_logprobs(logprobs_one_position, make_entry):
++    """NRL score centering: re-expand the i.i.d. sampler draws stored with multiplicities (Logprob.sc_count) into a
++    flat list of exactly m entries (order irrelevant, draws are i.i.d.). `make_entry(token_id, logprob_obj)` builds
++    one output object; repeated draws share it."""
++    out = []
++    for token_id, lp in logprobs_one_position.items():
++        count = getattr(lp, "sc_count", 0)
++        if count <= 0:
++            continue
++        entry = make_entry(token_id, lp)
++        out.extend([entry] * count)
++    return out
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -56,7 +56,11 @@
+ )
+ from vllm.inputs import EngineInput, MultiModalPlaceholders
+ from vllm.logger import init_logger
+-from vllm.logprobs import Logprob
++from vllm.logprobs import (  # NRL score centering: i.i.d. draw expansion
++    NRL_SC_IID_LOGPROBS,
++    Logprob,
++    nrl_sc_expand_iid_top_logprobs,
++)
+ from vllm.outputs import RequestOutput
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+@@ -1097,6 +1101,22 @@
+         tokenizer: TokenizerLike | None,
+         should_return_as_token_id: bool,
+     ) -> list[ChatCompletionLogProb]:
++        if NRL_SC_IID_LOGPROBS and top_logprobs and top_logprobs != -1:
++            # NRL score centering: the "top" slots hold i.i.d. sampler draws with multiplicities -> exactly m entries.
++            def _make_entry(token_id: int, lp: Logprob) -> ChatCompletionLogProb:
++                token = self._get_decoded_token(
++                    lp,
++                    token_id,
++                    tokenizer,
++                    return_as_token_id=should_return_as_token_id,
++                )
++                return ChatCompletionLogProb(
++                    token=token,
++                    logprob=max(lp.logprob, -9999.0),
++                    bytes=list(token.encode("utf-8", errors="replace")),
++                )
++
++            return nrl_sc_expand_iid_top_logprobs(logprobs, _make_entry)
+         return [
+             ChatCompletionLogProb(
+                 token=(

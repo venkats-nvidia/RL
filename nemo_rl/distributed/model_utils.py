@@ -1385,6 +1385,223 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     return out_logprobs
 
 
+# ---------------------------------------------------------------------------
+# NRL score centering (GDPVal V2 port): trainer log-probs of the m i.i.d.
+# sampler draws per position (arXiv 2609.20807). Both helpers mirror the
+# token-logprob functions above (same per-sequence roll, CP sharding, TP
+# log-softmax, CP all-gather and unpacking) but gather K indices per position
+# through ChunkedDistributedGatherLogprob, whose backward recomputes the
+# softmax chunk by chunk so only the logits are kept.
+# ---------------------------------------------------------------------------
+
+
+def from_parallel_logits_to_sample_logprobs_packed_sequences(
+    vocab_parallel_logits: torch.Tensor,
+    sample_targets: torch.Tensor,
+    cu_seqlens_padded: Any,
+    unpacked_seqlen: int,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: Optional[torch.distributed.ProcessGroup],
+    inference_only: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """NRL score centering: log-probs of K extra token indices per position (packed).
+
+    Mirrors ``from_parallel_logits_to_logprobs_packed_sequences`` with
+    unrolled targets — per-sequence roll by -1 at the PADDED sequence length,
+    CP sharding, TP-distributed log-softmax, per-sequence CP all-gather,
+    unpack dropping each sequence's last slot — but gathers K indices per
+    position with one chunked log-softmax (``ChunkedDistributedGatherLogprob``).
+    The rolled layout is identical to ``loss.utils._pack_input_ids(...,
+    roll_shift=-1)``, which builds the sampled-token targets of the fused path.
+
+    Alignment contract (same as the token log-probs): ``sample_targets`` is
+    UNROLLED — position ``t`` holds the draws taken when token ``t`` was
+    sampled, exactly like ``input_ids[t]`` holds token ``t`` — and the returned
+    ``[B, S-1, K]`` tensor holds ``log p(v_{t+1,k} | prefix_t)`` at index ``t``,
+    aligned with the ``[B, S-1]`` token log-probs.
+
+    Args:
+        vocab_parallel_logits: ``[1, T // CP, vocab_size // TP]`` packed logits
+            (any float dtype; cast to float32 per chunk).
+        sample_targets: ``[1, T, K]`` int64 draw indices in the full (not
+            CP-adjusted) packed layout, unrolled.
+        cu_seqlens_padded: padded cumulative sequence lengths ``[B+1]``
+            (tensor or int sequence).
+        unpacked_seqlen: Width of the unpacked ``[B, S]`` batch.
+        vocab_start_index, vocab_end_index, group, inference_only, cp_group: as in
+            ``from_parallel_logits_to_logprobs_packed_sequences``.
+        chunk_size: Sequence chunk for the distributed log-softmax (bounds the
+            float32 working set to ``[1, chunk_size, V_local]``).
+
+    Returns:
+        ``[batch_size, unpacked_seqlen - 1, K]`` float32 log-probs.
+    """
+    batch_size = len(cu_seqlens_padded) - 1
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+    if sample_targets.dim() != 3 or sample_targets.shape[0] != 1:
+        raise ValueError(
+            f"sample_targets must be [1, T, K], got {tuple(sample_targets.shape)}"
+        )
+    target = sample_targets.squeeze(0).to(torch.int64)  # [T, K]
+    num_samples = int(target.shape[-1])
+    rolled_targets = torch.zeros(
+        (target.shape[0] // cp_size, num_samples),
+        dtype=torch.int64,
+        device=target.device,
+    )
+    for i in range(batch_size):
+        start_idx = int(cu_seqlens_padded[i])
+        end_idx = int(cu_seqlens_padded[i + 1])
+        seq_targets = target[start_idx:end_idx].roll(shifts=-1, dims=0)
+        rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+            _get_tokens_on_this_cp_rank(seq_targets, cp_rank, cp_size, seq_dim=0)
+        )
+    vals: torch.Tensor = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+        vocab_parallel_logits,
+        rolled_targets.unsqueeze(0),
+        vocab_start_index,
+        vocab_end_index,
+        int(chunk_size),
+        group,
+        inference_only,
+    )
+    vals = vals.squeeze(0)  # [T // CP, K]
+    if cp_size > 1:
+        final_vals = torch.zeros(
+            (vals.shape[0] * cp_size, num_samples), dtype=vals.dtype, device=vals.device
+        )
+        for i in range(batch_size):
+            start_idx = int(cu_seqlens_padded[i])
+            end_idx = int(cu_seqlens_padded[i + 1])
+            final_vals[start_idx:end_idx] = allgather_cp_sharded_tensor(
+                vals[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
+            )
+        vals = final_vals
+    out = torch.zeros(
+        (batch_size, unpacked_seqlen - 1, num_samples),
+        dtype=vals.dtype,
+        device=vals.device,
+    )
+    for i in range(batch_size):
+        start_idx = int(cu_seqlens_padded[i])
+        end_idx = int(cu_seqlens_padded[i + 1])
+        if end_idx - start_idx > 0:
+            # Exclude the last position (its rolled target comes from position 0).
+            seq_vals = vals[start_idx : end_idx - 1]
+            seq_len = min(seq_vals.shape[0], unpacked_seqlen - 1)
+            if seq_len > 0:
+                out[i, :seq_len] = seq_vals[:seq_len]
+    return out
+
+
+def from_parallel_logits_to_sample_logprobs(
+    vocab_parallel_logits: torch.Tensor,
+    sample_targets: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    inference_only: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """NRL score centering: log-probs of K extra token indices per position (unpacked).
+
+    Mirrors ``from_parallel_logits_to_logprobs`` (roll by -1 along the sequence,
+    pad to the CP multiple, CP shard, TP log-softmax gather, CP all-gather,
+    strip padding, drop the last position).
+
+    Args:
+        vocab_parallel_logits: ``[B, S // CP, vocab_size // TP]``.
+        sample_targets: ``[B, S, K]`` int64, UNROLLED (see the packed variant).
+
+    Returns:
+        ``[B, S - 1, K]`` float32 log-probs.
+    """
+    if sample_targets.dim() != 3:
+        raise ValueError(
+            f"sample_targets must be [B, S, K], got {tuple(sample_targets.shape)}"
+        )
+    target = sample_targets.to(torch.int64).roll(shifts=-1, dims=1)
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    pad_len = vocab_parallel_logits.shape[1] * cp_size - target.shape[1]
+    if pad_len > 0:
+        target = torch.nn.functional.pad(target, (0, 0, 0, pad_len), value=0)
+    if cp_size > 1:
+        cp_rank = torch.distributed.get_rank(cp_group)
+        target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    if chunk_size is None:
+        chunk_size = max(int(vocab_parallel_logits.shape[1]), 1)
+    vals: torch.Tensor = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+        vocab_parallel_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        int(chunk_size),
+        tp_group,
+        inference_only,
+    )
+    if cp_size > 1:
+        vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=1)
+    if pad_len > 0:
+        vals = vals[:, :-pad_len]
+    return vals[:, :-1]
+
+
+def get_next_token_sample_logprobs_from_logits(
+    sample_token_ids: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+) -> torch.Tensor:
+    """NRL score centering: unpacked counterpart of ``get_next_token_logprobs_from_logits``.
+
+    Supports the Megatron vocab-parallel path (TP and TP+CP) and the plain
+    non-parallel path; the Automodel DTensor / ``cp_sharder`` layouts are not
+    implemented (score centering is validated on the Megatron trainer).
+
+    Args:
+        sample_token_ids: ``[B, S, K]`` draw indices, unrolled.
+        next_token_logits: ``[B, S(, // CP), V(// TP)]`` logits.
+
+    Returns:
+        ``[B, S - 1, K]`` float32 log-probs aligned with the token log-probs.
+    """
+    if cp_sharder is not None or isinstance(
+        next_token_logits, torch.distributed.tensor.DTensor
+    ):
+        raise NotImplementedError(
+            "score centering is not implemented for the Automodel DTensor / "
+            "context-parallel sharder paths; use the Megatron policy"
+        )
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        vals = from_parallel_logits_to_sample_logprobs(
+            next_token_logits,
+            sample_token_ids,
+            vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+            tp_group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            chunk_size=chunk_size,
+        )
+        return vals[:, : sample_token_ids.shape[1] - 1]
+    # Non-parallel: full-vocabulary log-softmax gathered at the next position's draws.
+    logits_wo_last = next_token_logits[:, :-1].to(torch.float32)
+    log_probs = torch.nn.functional.log_softmax(logits_wo_last, dim=-1)
+    next_draws = sample_token_ids[:, 1:].to(device=log_probs.device, dtype=torch.int64)
+    return log_probs.gather(dim=-1, index=next_draws)
+
+
 def _get_tokens_on_this_cp_rank(
     input_ids: torch.Tensor,
     cp_rank: int,

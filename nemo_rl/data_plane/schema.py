@@ -63,6 +63,37 @@ OPD_FULL_HIDDEN_STATES_FIELD = "teacher_full_hidden_states"
 OPD_FULL_LOGITS_FIELD = "teacher_full_logits"
 OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
 
+# NRL score centering (GDPVal V2 port; arXiv 2609.20807, i.i.d. sampler-draw
+# variant). Per-token columns carried from the token-capture finalizer to the
+# trainer loss when ``loss_fn.score_centering.enabled``: the ``m`` i.i.d. draws
+# the sampler took from its own token distribution at every generated position,
+# their sampler log-probs, and a per-token flag saying whether the position
+# carries draws. Shapes per row: ``[S, m]`` int32, ``[S, m]`` float32, ``[S]``
+# float32. Kept out of the static field tuples (like the PPO value / opd_full
+# columns): a run without the block registers and fetches an unchanged list
+# (see ``fields_with_optional_score_centering``).
+SC_SAMPLE_TOKEN_IDS_FIELD = "sc_sample_token_ids"
+SC_SAMPLE_LOGPROBS_FIELD = "sc_sample_logprobs"
+SC_SAMPLE_MASK_FIELD = "sc_sample_mask"
+SC_FIELDS = (
+    SC_SAMPLE_TOKEN_IDS_FIELD,
+    SC_SAMPLE_LOGPROBS_FIELD,
+    SC_SAMPLE_MASK_FIELD,
+)
+# Token-capture staging columns (one staged call = one delta): the draws laid
+# over the delta's positions (carry positions zero-filled) and a per-row
+# presence flag. Written by ``TQTokenSink.stage`` in the same ``put`` as the
+# token columns (never digest-covered), read back by the finalizer for the
+# terminal chain only. Registered only when centering is enabled.
+SC_STAGING_TOKEN_IDS_FIELD = "sc_sample_token_ids_delta"
+SC_STAGING_LOGPROBS_FIELD = "sc_sample_logprobs_delta"
+SC_STAGING_PRESENT_FIELD = "sc_present"
+SC_STAGING_FIELDS = (
+    SC_STAGING_TOKEN_IDS_FIELD,
+    SC_STAGING_LOGPROBS_FIELD,
+    SC_STAGING_PRESENT_FIELD,
+)
+
 
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
@@ -148,6 +179,24 @@ def fields_with_optional_routed_experts(
     out = list(fields)
     if enabled and ROUTED_EXPERTS_FIELD not in out:
         out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_optional_score_centering(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return `fields` plus the score-centering columns when the loss enables them.
+
+    NRL score centering (GDPVal V2 port). Added only when
+    ``loss_fn.score_centering`` is enabled: a run without the block
+    registers/fetches an unchanged list, and a worker requesting a column
+    nobody wrote would error on read.
+    """
+    out = list(fields)
+    if enabled:
+        out.extend(field for field in SC_FIELDS if field not in out)
     return out
 
 

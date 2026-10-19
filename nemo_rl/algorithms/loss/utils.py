@@ -33,15 +33,51 @@ from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs_packed_sequences,
+    from_parallel_logits_to_sample_logprobs_packed_sequences,
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_next_token_sample_logprobs_from_logits,
 )
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+# NRL score centering (GDPVal V2 port): name of the extra loss input carrying
+# the trainer log-probs of the m i.i.d. sampler draws, [B, S-1, m] with grad,
+# and the batch column holding the draws themselves.
+SC_LOSS_INPUT_KEY = "next_token_sample_logprobs"
+SC_SAMPLE_TOKEN_IDS_KEY = "sc_sample_token_ids"
+# Default sequence chunk for the draw gather when policy.logprob_chunk_size is
+# unset (V1 ran 1024 at 256K/CP16; one chunk = [1, chunk, V_local] float32).
+SC_DEFAULT_CHUNK_SIZE = 1024
+
+
+def _score_centering_requested(loss_fn: LossFunction, data: Any) -> bool:
+    """Whether the loss wants the draw log-probs for this microbatch.
+
+    Fails loudly when the loss has centering enabled but the batch carries no
+    draws: training the plain baseline under the score-centering name is the
+    failure mode every V1 guard exists to prevent.
+    """
+    if not getattr(loss_fn, "score_centering_enabled", False):
+        return False
+    if SC_SAMPLE_TOKEN_IDS_KEY not in data:
+        raise RuntimeError(
+            "loss_fn.score_centering.enabled=true but the training batch carries "
+            f"no {SC_SAMPLE_TOKEN_IDS_KEY!r} column: the rollout producer did not "
+            "attach sampler draws (check the data-plane field registration, the "
+            "token-capture draw staging and the vLLM patch)."
+        )
+    if getattr(loss_fn, "use_fused_linear_logprobs", False):
+        raise NotImplementedError(
+            "score centering needs the full logits to gather the draws' "
+            "log-probs; disable the chunked linear-CE fusion "
+            "(use_fused_linear_logprobs) when loss_fn.score_centering is enabled."
+        )
+    return True
 
 
 def map_teacher_logits_to_draft_vocab(
@@ -466,6 +502,27 @@ def prepare_loss_input(
 
         loss_input = {"next_token_logprobs": logprobs}
 
+        # NRL score centering (GDPVal V2 port): trainer log-probs of the m
+        # i.i.d. sampler draws per position, same alignment as
+        # next_token_logprobs (used by the unpacked path and by the per-sequence
+        # SequencePackingLossWrapper, i.e. sequence_packing.fuse_loss=false).
+        if _score_centering_requested(loss_fn, data):
+            if need_top_k_or_top_p_filtering(sampling_params):
+                raise NotImplementedError(
+                    "score centering with top-k/top-p training-side filtering is "
+                    "not supported (the draws' sampler distribution q would have "
+                    "to be the filtered one)"
+                )
+            loss_input[SC_LOSS_INPUT_KEY] = get_next_token_sample_logprobs_from_logits(
+                sample_token_ids=data[SC_SAMPLE_TOKEN_IDS_KEY],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
+            )
+
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = prepare_opd_full_loss_input(
             logits,
@@ -658,6 +715,32 @@ def _pack_input_ids(
     return packed.unsqueeze(0)
 
 
+def _pack_per_token_values(
+    values: torch.Tensor,
+    cu_seqlens_q: Any,
+    cu_seqlens_q_padded: Any,
+) -> torch.Tensor:
+    """NRL score centering (GDPVal V2 port): pack ``[B, S, ...]`` to ``[1, T_packed, ...]``.
+
+    Same padded sequence boundaries as :func:`_pack_input_ids` (trailing dims
+    kept, no roll, no CP sharding: the packed-sequence draw gather rolls and
+    CP-shards each padded sequence itself, which reproduces
+    ``_pack_input_ids(..., roll_shift=-1)``). Padding slots stay zero and are
+    excluded from the loss by the masks.
+    """
+    batch_size = values.shape[0]
+    total_packed_len = int(cu_seqlens_q_padded[-1])
+    packed = torch.zeros(
+        (total_packed_len, *values.shape[2:]), dtype=values.dtype, device=values.device
+    )
+    for i in range(batch_size):
+        actual_len = int(cu_seqlens_q[i + 1]) - int(cu_seqlens_q[i])
+        copy_len = min(actual_len, values.shape[1])
+        packed_start = int(cu_seqlens_q_padded[i])
+        packed[packed_start : packed_start + copy_len] = values[i, :copy_len]
+    return packed.unsqueeze(0)
+
+
 def prepare_packed_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -788,4 +871,46 @@ def prepare_packed_loss_input(
                 )
             )
 
-    return {"next_token_logprobs": logprobs}, data
+    loss_input: dict[str, Any] = {"next_token_logprobs": logprobs}
+
+    # NRL score centering (GDPVal V2 port): trainer log-probs of the m i.i.d.
+    # sampler draws per position, in the same packed / CP-sharded layout as the
+    # targets (one chunked distributed log-softmax gathered at m indices per
+    # position; the backward recomputes the softmax chunk by chunk, so only the
+    # logits are kept). This is the sequence_packing.fuse_loss=true path, so
+    # unlike a top-k variant that only patched prepare_loss_input, centering
+    # does not require fuse_loss=false.
+    if _score_centering_requested(loss_fn, data):
+        if input_is_prepacked:
+            raise NotImplementedError(
+                "score centering is not supported for pre-packed (Energon) rows"
+            )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            raise NotImplementedError(
+                "score centering with top-k/top-p training-side filtering is not "
+                "supported (the draws' sampler distribution q would have to be "
+                "the filtered one)"
+            )
+        packed_samples = _pack_per_token_values(
+            data[SC_SAMPLE_TOKEN_IDS_KEY].to(torch.int64),
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+        )  # [1, T_packed, m], unrolled; the gather rolls + CP-shards per sequence
+        loss_input[SC_LOSS_INPUT_KEY] = (
+            from_parallel_logits_to_sample_logprobs_packed_sequences(
+                logits,
+                packed_samples,
+                cu_seqlens_q_padded,
+                unpacked_seqlen,
+                vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+                chunk_size=(
+                    chunk_size if chunk_size is not None else SC_DEFAULT_CHUNK_SIZE
+                ),
+            )
+        )
+
+    return loss_input, data
